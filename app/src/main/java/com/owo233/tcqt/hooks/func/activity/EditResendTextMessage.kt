@@ -5,12 +5,13 @@ import com.owo233.tcqt.R
 import com.owo233.tcqt.annotations.RegisterAction
 import com.owo233.tcqt.ext.ActionProcess
 import com.owo233.tcqt.ext.IAction
+import com.owo233.tcqt.hooks.base.loadOrThrow
 import com.owo233.tcqt.hooks.helper.CustomMenu
 import com.owo233.tcqt.hooks.helper.OnMenuBuilder
 import com.owo233.tcqt.internals.QQInterfaces
-import com.owo233.tcqt.utils.dexkit.DexKitTask
 import com.owo233.tcqt.utils.hook.MethodHookParam
 import com.owo233.tcqt.utils.hook.hookAfter
+import com.owo233.tcqt.utils.hook.paramCount
 import com.owo233.tcqt.utils.log.Log
 import com.owo233.tcqt.utils.reflect.getFields
 import com.owo233.tcqt.utils.reflect.getMethods
@@ -21,15 +22,12 @@ import com.tencent.qqnt.kernel.nativeinterface.MsgConstant
 import com.tencent.qqnt.kernel.nativeinterface.MsgRecord
 import com.tencent.qqnt.kernelpublic.nativeinterface.Contact
 import com.tencent.qqnt.msg.api.IMsgService
-import org.luckypray.dexkit.DexKitBridge
-import org.luckypray.dexkit.query.FindClass
-import org.luckypray.dexkit.query.FindMethod
 import java.lang.reflect.Method
 import java.util.ArrayList
 import java.util.concurrent.ConcurrentHashMap
 
 @RegisterAction
-class EditResendTextMessage : IAction, OnMenuBuilder, DexKitTask {
+class EditResendTextMessage : IAction, OnMenuBuilder {
 
     override val name: String get() = "快捷编辑重发消息"
     override val desc: String get() = "长按自己发送的文本消息显示重新编辑按钮。"
@@ -45,28 +43,6 @@ class EditResendTextMessage : IAction, OnMenuBuilder, DexKitTask {
         }.onFailure { e ->
             Log.e("edit resend failed: hook official gray tip re-edit", e)
         }
-    }
-
-    override fun execute(bridge: DexKitBridge, cache: MutableMap<String, String>) {
-        bridge.findMethod(
-            FindMethod().apply {
-                searchPackages("com.tencent.mobileqq.aio.msglist.holder.component.graptips.revoke")
-                matcher {
-                    paramCount = 3
-                    usingStrings(
-                        "em_bas_aio_small_gray",
-                        "small_gray_service_id"
-                    )
-                }
-            }
-        ).firstOrNull()?.let {
-            cache[REVOKE_GRAY_TIPS_BIND] = it.descriptor
-        } ?: Log.e("EditResendTextMessage: revoke gray tips bind method not found")
-
-        cacheClassByEventName(bridge, cache, REVOKE_CHECK_EVENT, REVOKE_CHECK_EVENT_NAME)
-        cacheClassByEventName(bridge, cache, REEDIT_SAVE_INTENT, REEDIT_SAVE_EVENT_NAME)
-        cacheClassByEventName(bridge, cache, RECOVER_MSG_ELEMENTS_INTENT, RECOVER_MSG_ELEMENTS_EVENT_NAME)
-        cacheClassByEventName(bridge, cache, SHOW_KEYBOARD_INTENT, SHOW_KEYBOARD_EVENT_NAME)
     }
 
     override fun onGetMenuNt(msg: Any, componentType: String, param: MethodHookParam) {
@@ -107,9 +83,16 @@ class EditResendTextMessage : IAction, OnMenuBuilder, DexKitTask {
     }
 
     private fun hookRevokeGrayTipReedit() {
-        val bindMethod = runCatching { requireMethod(REVOKE_GRAY_TIPS_BIND) }.getOrNull()
+        val bindMethod = loadOrThrow(REVOKE_GRAY_TIPS_COMPONENT)
+            .declaredMethods
+            .firstOrNull { method ->
+                method.paramCount == 3 &&
+                    method.parameterTypes[0] == Int::class.javaPrimitiveType &&
+                    method.parameterTypes[2] == List::class.java
+            }
             ?: error("revoke gray tips bind method not found")
 
+        bindMethod.isAccessible = true
         bindMethod.hookAfter { param ->
             val grayTipsMsgItem = param.args.getOrNull(1) ?: return@hookAfter
             triggerPendingReedit(param.thisObject, grayTipsMsgItem)
@@ -117,7 +100,7 @@ class EditResendTextMessage : IAction, OnMenuBuilder, DexKitTask {
     }
 
     private fun quickReeditByOfficialFlow(component: Any, msg: Any, msgRecord: MsgRecord): Boolean {
-        val revokeCheck = requireClass(REVOKE_CHECK_EVENT).new(msg, true, 0, null)
+        val revokeCheck = loadOrThrow(REVOKE_CHECK_EVENT).new(msg, true, 0, null)
         val eventBus = component.findOfficialEventBus(revokeCheck) ?: return false
         cleanupPendingReedit()
         pendingReedits[msgRecord.msgId] = PendingReedit.from(msgRecord)
@@ -175,10 +158,10 @@ class EditResendTextMessage : IAction, OnMenuBuilder, DexKitTask {
                 if (recalledMsg.msgType != MsgConstant.KMSGTYPEGRAYTIPS) return
 
                 runCatching {
-                    val recoverElements = requireClass(RECOVER_MSG_ELEMENTS_INTENT)
+                    val recoverElements = loadOrThrow(RECOVER_MSG_ELEMENTS_INTENT)
                         .new(recalledMsg.elements)
-                    val showKeyboard = requireClass(SHOW_KEYBOARD_INTENT).new(0L)
-                    val reeditSave = requireClass(REEDIT_SAVE_INTENT).new(recalledMsg)
+                    val showKeyboard = loadOrThrow(SHOW_KEYBOARD_INTENT).new(0L)
+                    val reeditSave = loadOrThrow(REEDIT_SAVE_INTENT).new(recalledMsg)
                     val eventBus = component.findOfficialEventBus(
                         recoverElements,
                         showKeyboard,
@@ -271,45 +254,17 @@ class EditResendTextMessage : IAction, OnMenuBuilder, DexKitTask {
         method.invoke(this, event)
     }
 
-    private fun cacheClassByEventName(
-        bridge: DexKitBridge,
-        cache: MutableMap<String, String>,
-        key: String,
-        eventName: String
-    ) {
-        bridge.findClass(
-            FindClass().apply {
-                matcher {
-                    methods {
-                        add {
-                            name("eventName")
-                            returnType(String::class.java)
-                            usingStrings(eventName)
-                        }
-                    }
-                }
-            }
-        ).singleOrNull()?.let {
-            cache[key] = it.descriptor
-        } ?: Log.e("EditResendTextMessage: event class not found: $eventName")
-    }
-
     private object MsgRecordHelper {
 
-        private val getMsgRecordMethods = ConcurrentHashMap<Class<*>, Method>()
+        private val getMsgRecordMethod by lazy {
+            loadOrThrow("com.tencent.mobileqq.aio.msg.AIOMsgItem")
+                .getDeclaredMethod("getMsgRecord")
+                .apply { isAccessible = true }
+        }
 
         fun getMsgRecord(msgItem: Any): MsgRecord {
             if (msgItem is MsgRecord) return msgItem
-
-            val method = getMsgRecordMethods.getOrPut(msgItem.javaClass) {
-                msgItem.javaClass.getMethods(true)
-                    .first { method ->
-                        method.parameterTypes.isEmpty() &&
-                            MsgRecord::class.java.isAssignableFrom(method.returnType)
-                    }
-                    .apply { isAccessible = true }
-            }
-            return method.invoke(msgItem) as MsgRecord
+            return getMsgRecordMethod.invoke(msgItem) as MsgRecord
         }
     }
 
@@ -343,18 +298,15 @@ class EditResendTextMessage : IAction, OnMenuBuilder, DexKitTask {
 
     private companion object {
         val pendingReedits = ConcurrentHashMap<Long, PendingReedit>()
-        const val REVOKE_GRAY_TIPS_BIND = "EditResendTextMessage.revokeGrayTipsBind"
-        const val REVOKE_CHECK_EVENT = "EditResendTextMessage.revokeCheckEvent"
-        const val REEDIT_SAVE_INTENT = "EditResendTextMessage.reeditSaveIntent"
-        const val RECOVER_MSG_ELEMENTS_INTENT = "EditResendTextMessage.recoverMsgElementsIntent"
-        const val SHOW_KEYBOARD_INTENT = "EditResendTextMessage.showKeyboardIntent"
-        const val REVOKE_CHECK_EVENT_NAME = "com.tencent.qqnt.aio.menu.MenuMsgEvent.RevokeCheck"
-        const val REEDIT_SAVE_EVENT_NAME =
-            "com.tencent.mobileqq.aio.msglist.holder.component.graptips.GrayTipsIntent.ReEditMsgSave"
-        const val RECOVER_MSG_ELEMENTS_EVENT_NAME =
-            "com.tencent.mobileqq.aio.input.draft.InputDraftMsgIntent.RecoverMsgElements"
-        const val SHOW_KEYBOARD_EVENT_NAME =
-            "com.tencent.mobileqq.aio.input.edit.InputEditTextMsgIntent.ShowKeyboardMsgIntent"
+        const val REVOKE_CHECK_EVENT = "com.tencent.qqnt.aio.menu.MenuMsgEvent\$RevokeCheck"
+        const val REEDIT_SAVE_INTENT =
+            "com.tencent.mobileqq.aio.msglist.holder.component.graptips.GrayTipsIntent\$ReEditMsgSave"
+        const val RECOVER_MSG_ELEMENTS_INTENT =
+            "com.tencent.mobileqq.aio.input.draft.InputDraftMsgIntent\$RecoverMsgElements"
+        const val SHOW_KEYBOARD_INTENT =
+            "com.tencent.mobileqq.aio.input.edit.InputEditTextMsgIntent\$ShowKeyboardMsgIntent"
+        const val REVOKE_GRAY_TIPS_COMPONENT =
+            "com.tencent.mobileqq.aio.msglist.holder.component.graptips.revoke.RevokeGrayTipsComponent"
         const val PENDING_REEDIT_TIMEOUT_MS = 30_000L
         const val REEDIT_TIME_LIMIT_SECONDS = 120L
         const val TEXT_COMPONENT = "com.tencent.mobileqq.aio.msglist.holder.component.text.AIOTextContentComponent"
